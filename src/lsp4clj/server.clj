@@ -25,7 +25,7 @@
 (defprotocol IBlockingDerefOrCancel
   (deref-or-cancel [this timeout-ms timeout-val]))
 
-(defrecord PendingRequest [p id method params started]
+(defrecord PendingRequest [p request started]
   clojure.lang.IDeref
   (deref [_] (deref p))
   clojure.lang.IBlockingDeref
@@ -58,8 +58,8 @@
 ;; Avoid error: java.lang.IllegalArgumentException: Multiple methods in multimethod 'simple-dispatch' match dispatch value: class lsp4clj.server.PendingRequest -> interface clojure.lang.IPersistentMap and interface clojure.lang.IDeref, and neither is preferred
 ;; Only when CIDER is running? See https://github.com/thi-ng/color/issues/10
 ;; Also see https://github.com/babashka/process/commit/e46a5f3e42321b3ecfda960b7b248a888b44aa3b
-(defmethod pprint/simple-dispatch PendingRequest [req]
-  (pprint/pprint (select-keys req [:id :method :started])))
+(defmethod pprint/simple-dispatch PendingRequest [{:keys [request started]}]
+  (pprint/pprint {:request (select-keys request [:id :method]) :started started}))
 
 (prefer-method print-method java.util.Map clojure.lang.IDeref)
 
@@ -82,21 +82,10 @@
 
   Sends `$/cancelRequest` only once, though `lsp4clj.server/deref-or-cancel` or
   `future-cancel` can be called multiple times."
-  [id method params started server]
+  [request started on-cancel]
   (let [p (p/deferred)]
-    ;; Set up a side-effect so that when the Request is cancelled, we inform the
-    ;; client. This cannot be `(-> (p/deferred) (p/catch))` because that returns
-    ;; a promise which, when cancelled, does nothing because there's no
-    ;; exception handler chained onto it. Instead, we must cancel the
-    ;; `(p/deferred)` promise itself.
-    (p/catch p cancellation-exception?
-      (fn [_]
-        (protocols.endpoint/send-notification server "$/cancelRequest" {:id id})))
-    (map->PendingRequest {:p p
-                          :id id
-                          :method method
-                          :params params
-                          :started started})))
+    (p/catch p cancellation-exception? (fn [_] (on-cancel)))
+    (map->PendingRequest {:p p :request request :started started})))
 
 (defn ^:private format-error-code [description error-code]
   (let [{:keys [code message]} (lsp.errors/by-key error-code)]
@@ -133,16 +122,6 @@
 (def send-request protocols.endpoint/send-request)
 (def send-notification protocols.endpoint/send-notification)
 
-;; Let language servers implement their own message receivers. These are
-;; slightly different from the identically named protocols.endpoint versions, in
-;; that they receive the message params, not the whole message.
-
-(defmulti receive-request (fn [method _context _params] method))
-(defmulti receive-notification (fn [method _context _params] method))
-
-(defmethod receive-request :default [_method _context _params] ::method-not-found)
-(defmethod receive-notification :default [_method _context _params] ::method-not-found)
-
 (defn ^:private internal-error-response [resp req]
   (let [error-body (lsp.errors/internal-error (select-keys req [:id :method]))]
     (lsp.responses/error resp error-body)))
@@ -167,13 +146,11 @@
   (-cancelled? [_]
     @cancelled?))
 
-(defn pending-received-request [method context params]
+(defn pending-received-request [{:keys [handle-request] :as server} context req]
   (let [cancelled? (atom false)
         ;; coerce result/error to promise
-        result-promise (p/promise
-                         (receive-request method
-                                          (assoc context ::req-cancelled? cancelled?)
-                                          params))]
+        context (assoc context ::req-cancelled? cancelled?)
+        result-promise (p/promise (handle-request server context req))]
     (map->PendingReceivedRequest
       {:result-promise result-promise
        :cancelled? cancelled?})))
@@ -189,7 +166,10 @@
                        request-id*
                        pending-sent-requests*
                        pending-received-requests*
-                       join]
+                       join
+                       on-cancel-request
+                       handle-request
+                       handle-notification]
   protocols.endpoint/IEndpoint
   (start [this context]
     ;; Start receiving messages.
@@ -231,7 +211,8 @@
         ;; The pipeline has closed, indicating input-ch has closed. We're done
         ;; receiving. Do cleanup.
 
-        (reject-pending-sent-requests (ex-info "Server shutting down. Input is closed so no response is possible." {}))
+        (reject-pending-sent-requests
+          (ex-info "Server shutting down. Input is closed so no response is possible." {}))
 
         (async/close! output-ch)
         (async/close! log-ch)
@@ -254,7 +235,7 @@
     (let [id (swap! request-id* inc)
           now (.instant clock)
           req (lsp.requests/request id method body)
-          pending-request (pending-request id method body now this)]
+          pending-request (pending-request req now #(on-cancel-request this req))]
       (trace this trace/sending-request req now)
       ;; Important: record request before sending it, so it's sure to be
       ;; available during receive-response.
@@ -273,9 +254,9 @@
     (try
       (let [now (.instant clock)
             [pending-requests _] (swap-vals! pending-sent-requests* dissoc id)]
-        (if-let [{:keys [p started] :as req} (get pending-requests id)]
+        (if-let [{:keys [p request started] :as req} (get pending-requests id)]
           (do
-            (trace this trace/received-response req resp started now)
+            (trace this trace/received-response request resp started now)
             ;; Note that we are called from the server's pipeline, a core.async
             ;; go-loop, and therefore must not block. Callbacks of the pending
             ;; request's promise (`p`) will be executed in the completing
@@ -297,7 +278,7 @@
           resp (lsp.responses/response id)]
       (try
         (trace this trace/received-request req started)
-        (let [pending-req (pending-received-request method context params)]
+        (let [pending-req (pending-received-request this context req)]
           (swap! pending-received-requests* assoc id pending-req)
           (-> pending-req
               :result-promise
@@ -331,21 +312,28 @@
     (try
       (let [now (.instant clock)]
         (trace this trace/received-notification notif now)
-        (if (= method "$/cancelRequest")
-          (if-let [pending-req (get @pending-received-requests* (:id params))]
-            (p/cancel! pending-req)
-            (trace this trace/received-unmatched-cancellation-notification notif now))
-          (let [result (receive-notification method context params)]
-            (when (identical? ::method-not-found result)
-              (protocols.endpoint/log this :warn "received unexpected notification" method)))))
+        (let [result (handle-notification this context notif)]
+          (when (identical? ::method-not-found result)
+            (protocols.endpoint/log this :warn "received unexpected notification" method))))
       (catch Throwable e
         (log-error-receiving this e notif)))))
 
 (defn set-trace-level [server trace-level]
   (update server :tracer* reset! (trace/tracer-for-level trace-level)))
 
+;; Let language servers implement their own message receivers. These are
+;; slightly different from the identically named protocols.endpoint versions, in
+;; that they receive the message params, not the whole message.
+
+(defmulti receive-request (fn [method _context _params] method))
+(defmulti receive-notification (fn [method _context _params] method))
+
+(defmethod receive-request :default [_method _context _params] ::method-not-found)
+(defmethod receive-notification :default [_method _context _params] ::method-not-found)
+
 (defn chan-server
-  [{:keys [output-ch input-ch log-ch trace? trace-level trace-ch clock on-close response-executor]
+  [{:keys [output-ch input-ch log-ch trace? trace-level trace-ch clock on-close
+           response-executor on-cancel-request handle-request handle-notification]
     :or {clock (java.time.Clock/systemDefaultZone)
          on-close (constantly nil)
          response-executor :default}}]
@@ -354,7 +342,26 @@
                                            (when (or trace? trace-ch) "verbose")
                                            "off"))
         log-ch (or log-ch (async/chan (async/sliding-buffer 20)))
-        trace-ch (or trace-ch (async/chan (async/sliding-buffer 20)))]
+        trace-ch (or trace-ch (async/chan (async/sliding-buffer 20)))
+        on-cancel-request
+        (or on-cancel-request
+            (fn [server {:keys [id]}]
+              (protocols.endpoint/send-notification
+                server "$/cancelRequest" {:id id})))
+        handle-request
+        (or handle-request
+            (fn [_server context {:keys [method params]}]
+              (receive-request method context params)))
+        handle-notification
+        (or handle-notification
+            (fn [server context {:keys [method params] :as notif}]
+              (case method
+                "$/cancelRequest"
+                (if-let [pending-req (get @(:pending-received-requests* server) (:id params))]
+                  (p/cancel! pending-req)
+                  (trace server trace/received-unmatched-cancellation-notification notif
+                         (.instant ^java.time.Clock (:clock server))))
+                (receive-notification method context params))))]
     (map->ChanServer
       {:output-ch output-ch
        :input-ch input-ch
@@ -367,4 +374,7 @@
        :request-id* (atom 0)
        :pending-sent-requests* (atom {})
        :pending-received-requests* (atom {})
-       :join (promise)})))
+       :join (promise)
+       :handle-request handle-request
+       :handle-notification handle-notification
+       :on-cancel-request on-cancel-request})))
