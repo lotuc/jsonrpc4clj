@@ -16,18 +16,8 @@
 
 (set! *warn-on-reflection* true)
 
-(def null-output-stream-writer
-  (java.io.OutputStreamWriter.
-    (proxy [java.io.OutputStream] []
-      (write
-        ([^bytes b])
-        ([^bytes b, off, len])))))
-
-(defmacro discarding-stdout
-  "Evaluates body in a context in which writes to *out* are discarded."
-  [& body]
-  `(binding [*out* null-output-stream-writer]
-     ~@body))
+(defn- cancellation-exception? [e]
+  (instance? CancellationException e))
 
 (defn- resolve-ex-data [p]
   (p/catch p (fn [ex] (or (ex-data ex) (p/rejected ex)))))
@@ -35,7 +25,7 @@
 (defprotocol IBlockingDerefOrCancel
   (deref-or-cancel [this timeout-ms timeout-val]))
 
-(defrecord PendingRequest [p id method started]
+(defrecord PendingRequest [p id method params started]
   clojure.lang.IDeref
   (deref [_] (deref p))
   clojure.lang.IBlockingDeref
@@ -71,6 +61,8 @@
 (defmethod pprint/simple-dispatch PendingRequest [req]
   (pprint/pprint (select-keys req [:id :method :started])))
 
+(prefer-method print-method java.util.Map clojure.lang.IDeref)
+
 (defn pending-request
   "Returns an object representing a pending JSON-RPC request to a remote
   endpoint. Deref the object to get the response.
@@ -90,19 +82,20 @@
 
   Sends `$/cancelRequest` only once, though `lsp4clj.server/deref-or-cancel` or
   `future-cancel` can be called multiple times."
-  [id method started server]
+  [id method params started server]
   (let [p (p/deferred)]
     ;; Set up a side-effect so that when the Request is cancelled, we inform the
     ;; client. This cannot be `(-> (p/deferred) (p/catch))` because that returns
     ;; a promise which, when cancelled, does nothing because there's no
     ;; exception handler chained onto it. Instead, we must cancel the
     ;; `(p/deferred)` promise itself.
-    (p/catch p CancellationException
+    (p/catch p cancellation-exception?
       (fn [_]
         (protocols.endpoint/send-notification server "$/cancelRequest" {:id id})))
     (map->PendingRequest {:p p
                           :id id
                           :method method
+                          :params params
                           :started started})))
 
 (defn ^:private format-error-code [description error-code]
@@ -117,11 +110,10 @@
 (defn thread-loop [buf-or-n f]
   (let [ch (async/chan buf-or-n)]
     (async/thread
-      (discarding-stdout
-        (loop []
-          (when-let [arg (async/<!! ch)]
-            (f arg)
-            (recur)))))
+      (loop []
+        (when-let [arg (async/<!! ch)]
+          (f arg)
+          (recur))))
     ch))
 
 (def input-buffer-size
@@ -186,11 +178,6 @@
       {:result-promise result-promise
        :cancelled? cancelled?})))
 
-;; TODO: https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#initialize
-;; * receive-request should return error until initialize request is received
-;; * receive-notification should drop until initialize request is received, with the exception of exit
-;; * send-request should do nothing until initialize response is sent, with the exception of window/showMessageRequest
-;; * send-notification should do nothing until initialize response is sent, with the exception of window/showMessage, window/logMessage, telemetry/event, and $/progress
 (defrecord ChanServer [input-ch
                        output-ch
                        log-ch
@@ -206,82 +193,38 @@
   protocols.endpoint/IEndpoint
   (start [this context]
     ;; Start receiving messages.
-    (let [;; The language server sometimes needs to stop processing inbound
-          ;; requests and notifications.
+    (let [client-initiated-in-ch
+          (thread-loop
+            input-buffer-size
+            (fn [[message-type message]]
+              (if (identical? :request message-type)
+                (protocols.endpoint/receive-request this context message)
+                (protocols.endpoint/receive-notification this context message))))
 
-          ;; We do this automatically whenever we receive a notification, so
-          ;; that we are sure the language server processes didChange before
-          ;; moving on to other requests. But the language server can also
-          ;; decide to do it itself, even in a request, by processing everything
-          ;; synchronously instead of returning a future.
+          reject-pending-sent-requests
+          (fn [exception]
+            (doseq [pending-request (vals @pending-sent-requests*)]
+              (p/reject! (:p pending-request)
+                         exception)))
 
-          ;; In a request (or even in a notification) the language server can
-          ;; send a request to the client and block waiting for a response.
-
-          ;; It's possible -- even likely -- that the client will send other
-          ;; messages between the time that the server sent its request and the
-          ;; time that the client responds.
-
-          ;; All inbound messages -- requests, notifications, and responses --
-          ;; come in on a single stream.
-
-          ;; If the server blocks waiting for a response, we have to set aside
-          ;; the other inbound requests and notifications, so that we can get to
-          ;; the response. That is, while the server is blocking we cannot stop
-          ;; accepting input. Otherwise, the server will end up in a deadlock,
-          ;; where it's waiting to receive a response, but the response is
-          ;; waiting to be accepted.
-
-          ;; To accomplish this we processes inbound requests and notifications
-          ;; separately from inbound responses. If the server starts blocking
-          ;; waiting for a response, we buffer the inbound requests and
-          ;; notifications until the server is prepared to process them.
-
-          ;; If the buffer becomes full, we assume that the server isn't
-          ;; handling inbound requests and notifcations because it's waiting for
-          ;; a response. So, following our assumption, we reject the server
-          ;; requests so that the server will stop waiting for the response.
-          ;; It's possible that this won't work -- our assumption might have
-          ;; been wrong and the server might have stalled for some other reason.
-          ;; So after rejecting, we park trying to add the latest inbound
-          ;; request or notification to the buffer.
-
-          ;; This ensures we don't drop any client messages, though we could
-          ;; stop reading them if the server keeps blocking. If we're lucky
-          ;; either the language server will unblock, or the client will decide
-          ;; to stop sending messages because it's failed to receive a server
-          ;; response (i.e., we will have managed to apply backpressure to the
-          ;; client). If we're unlucky, the server could keep blocking forever.
-          ;; In any case, this scenario -- where we stop reading messages -- is
-          ;; presumed to be both very rare and indicative of a problem that can
-          ;; be solved only in the client or the language server.
-          client-initiated-in-ch (thread-loop
-                                   input-buffer-size
-                                   (fn [[message-type message]]
-                                     (if (identical? :request message-type)
-                                       (protocols.endpoint/receive-request this context message)
-                                       (protocols.endpoint/receive-notification this context message))))
-          reject-pending-sent-requests (fn [exception]
-                                         (doseq [pending-request (vals @pending-sent-requests*)]
-                                           (p/reject! (:p pending-request)
-                                                      exception)))
-          pipeline (async/go-loop []
-                     (if-let [message (async/<! input-ch)]
-                       (let [message-type (coercer/input-message-type message)]
-                         (case message-type
-                           (:parse-error :invalid-request)
-                           (protocols.endpoint/log this :error (format-error-code "Error reading message" message-type))
-                           (:response.result :response.error)
-                           (protocols.endpoint/receive-response this message)
-                           (:request :notification)
-                           (when-not (async/offer! client-initiated-in-ch [message-type message])
-                             ;; Buffers full. Fail any waiting pending requests and...
-                             (reject-pending-sent-requests
-                               (ex-info "Buffer of client messages exhausted." {}))
-                             ;; ... try again, but park this time.
-                             (async/>! client-initiated-in-ch [message-type message])))
-                         (recur))
-                       (async/close! client-initiated-in-ch)))]
+          pipeline
+          (async/go-loop []
+            (if-let [message (async/<! input-ch)]
+              (let [message-type (coercer/input-message-type message)]
+                (case message-type
+                  (:parse-error :invalid-request)
+                  (protocols.endpoint/log this :error (format-error-code "Error reading message" message-type))
+                  (:response.result :response.error)
+                  (protocols.endpoint/receive-response this message)
+                  (:request :notification)
+                  (when-not (async/offer! client-initiated-in-ch [message-type message])
+                    ;; Buffers full. Fail any waiting pending requests and...
+                    (reject-pending-sent-requests
+                      (ex-info "Buffer of client messages exhausted." {}))
+                    ;; ... try again, but park this time.
+                    (async/>! client-initiated-in-ch [message-type message])))
+                (recur))
+              (async/close! client-initiated-in-ch)))]
       (async/go
         ;; Wait to stop receiving messages.
         (async/<! pipeline)
@@ -290,26 +233,6 @@
 
         (reject-pending-sent-requests (ex-info "Server shutting down. Input is closed so no response is possible." {}))
 
-        ;; The [docs](https://clojuredocs.org/clojure.core.async/close!) for
-        ;; `close!` say A) "The channel will no longer accept any puts", B)
-        ;; "Data in the channel remains available for taking", and C) "Logically
-        ;; closing happens after all puts have been delivered."
-
-        ;; At this point the input-ch has been closed, which means any messages
-        ;; that were read before the channel was closed have been put on the
-        ;; channel (C). However, the takes off of it, the takes which then
-        ;; forward the messages to the language server, may or may not have
-        ;; happened (B). And even if the language server has received some
-        ;; messages, if it responds after this line closes the output-ch, the
-        ;; responses will be dropped (A).
-
-        ;; All that to say, it's possible for the lsp4clj server to drop the
-        ;; language server's final few responses.
-
-        ;; It doesn't really matter though, because the users of lsp4clj
-        ;; typically don't call `shutdown` on the lsp4clj server until they've
-        ;; received the `exit` notification, which is the client indicating it
-        ;; no longer expects any responses anyway.
         (async/close! output-ch)
         (async/close! log-ch)
         (some-> trace-ch async/close!)
@@ -331,7 +254,7 @@
     (let [id (swap! request-id* inc)
           now (.instant clock)
           req (lsp.requests/request id method body)
-          pending-request (pending-request id method now this)]
+          pending-request (pending-request id method body now this)]
       (trace this trace/sending-request req now)
       ;; Important: record request before sending it, so it's sure to be
       ;; available during receive-response.
@@ -391,7 +314,7 @@
               ;; 2. Cancelled requests.
               (p/catch
                (fn [e]
-                 (if (instance? CancellationException e)
+                 (if (cancellation-exception? e)
                    (cancellation-response resp req)
                    (do
                      (log-error-receiving this e req)
