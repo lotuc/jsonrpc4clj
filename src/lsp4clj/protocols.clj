@@ -1,4 +1,4 @@
-(ns lsp4clj.protocols.endpoint)
+(ns lsp4clj.protocols)
 
 (defprotocol IEndpoint
   (start [this context])
@@ -9,3 +9,10 @@
   (receive-response [this resp])
   (receive-request [this context req])
   (receive-notification [this context notif]))
+
+(defprotocol IClock
+  (instant [_]))
+
+(defprotocol IInstant
+  (to-epoch-milli [_])
+  (truncate-to-millis-iso-string [_]))

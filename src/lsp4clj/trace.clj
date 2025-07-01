@@ -1,12 +1,12 @@
 (ns lsp4clj.trace
   (:require
-   [cheshire.core :as json]))
+   [cheshire.core :as json]
+   [lsp4clj.protocols :as protocols]))
 
 (set! *warn-on-reflection* true)
 
-(defn ^:private format-tag [^java.time.Instant at]
-  (format "[Trace - %s]"
-          (str (.truncatedTo at java.time.temporal.ChronoUnit/MILLIS))))
+(defn ^:private format-tag [at]
+  (format "[Trace - %s]" (protocols/truncate-to-millis-iso-string at)))
 
 (defn ^:private format-request-signature [{:keys [method id]}]
   (format "'%s - (%s)'" method id))
@@ -25,8 +25,8 @@
     (format-body "Error data" (:data error))
     (format-body "Result" result)))
 
-(defn ^:private latency [^java.time.Instant started ^java.time.Instant finished]
-  (format "%sms" (- (.toEpochMilli finished) (.toEpochMilli started))))
+(defn ^:private latency [started  finished]
+  (format "%sms" (- (protocols/to-epoch-milli finished) (protocols/to-epoch-milli started))))
 
 (defn ^:private format-response-header-details [req {:keys [error]} started finished]
   (format

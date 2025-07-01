@@ -6,7 +6,7 @@
    [lsp4clj.lsp.errors :as lsp.errors]
    [lsp4clj.lsp.requests :as lsp.requests]
    [lsp4clj.lsp.responses :as lsp.responses]
-   [lsp4clj.protocols.endpoint :as protocols.endpoint]
+   [lsp4clj.protocols :as protocols]
    [lsp4clj.trace :as trace]
    [promesa.core :as p]
    [promesa.exec :as p.exec]
@@ -21,6 +21,18 @@
 
 (defn- resolve-ex-data [p]
   (p/catch p (fn [ex] (or (ex-data ex) (p/rejected ex)))))
+
+(extend-type java.time.Clock
+  protocols/IClock
+  (instant [v] (.instant v)))
+
+(extend-type java.time.Instant
+  protocols/IInstant
+  (to-epoch-milli [v] (.toEpochMilli v))
+  (truncate-to-millis-iso-string [v] (str (.truncatedTo v java.time.temporal.ChronoUnit/MILLIS))))
+
+(defn build-default-clock []
+  (java.time.Clock/systemDefaultZone))
 
 (defprotocol IBlockingDerefOrCancel
   (deref-or-cancel [this timeout-ms timeout-val]))
@@ -94,7 +106,7 @@
 (defn ^:private log-error-receiving [server e message]
   (let [message-details (select-keys message [:id :method])
         log-title (format-error-code "Error receiving message" :internal-error)]
-    (protocols.endpoint/log server :error e (str log-title "\n" message-details))))
+    (protocols/log server :error e (str log-title "\n" message-details))))
 
 (defn thread-loop [buf-or-n f]
   (let [ch (async/chan buf-or-n)]
@@ -117,10 +129,10 @@
 
 ;; Expose endpoint methods to language servers
 
-(def start protocols.endpoint/start)
-(def shutdown protocols.endpoint/shutdown)
-(def send-request protocols.endpoint/send-request)
-(def send-notification protocols.endpoint/send-notification)
+(def start protocols/start)
+(def shutdown protocols/shutdown)
+(def send-request protocols/send-request)
+(def send-notification protocols/send-notification)
 
 (defn ^:private internal-error-response [resp req]
   (let [error-body (lsp.errors/internal-error (select-keys req [:id :method]))]
@@ -160,7 +172,7 @@
                        log-ch
                        trace-ch
                        tracer*
-                       ^java.time.Clock clock
+                       clock
                        response-executor
                        on-close
                        request-id*
@@ -170,7 +182,7 @@
                        on-cancel-request
                        handle-request
                        handle-notification]
-  protocols.endpoint/IEndpoint
+  protocols/IEndpoint
   (start [this context]
     ;; Start receiving messages.
     (let [client-initiated-in-ch
@@ -178,8 +190,8 @@
             input-buffer-size
             (fn [[message-type message]]
               (if (identical? :request message-type)
-                (protocols.endpoint/receive-request this context message)
-                (protocols.endpoint/receive-notification this context message))))
+                (protocols/receive-request this context message)
+                (protocols/receive-notification this context message))))
 
           reject-pending-sent-requests
           (fn [exception]
@@ -193,9 +205,9 @@
               (let [message-type (coercer/input-message-type message)]
                 (case message-type
                   (:parse-error :invalid-request)
-                  (protocols.endpoint/log this :error (format-error-code "Error reading message" message-type))
+                  (protocols/log this :error (format-error-code "Error reading message" message-type))
                   (:response.result :response.error)
-                  (protocols.endpoint/receive-response this message)
+                  (protocols/receive-response this message)
                   (:request :notification)
                   (when-not (async/offer! client-initiated-in-ch [message-type message])
                     ;; Buffers full. Fail any waiting pending requests and...
@@ -233,7 +245,7 @@
     (async/put! log-ch [level arg1 arg2]))
   (send-request [this method body]
     (let [id (swap! request-id* inc)
-          now (.instant clock)
+          now (protocols/instant clock)
           req (lsp.requests/request id method body)
           pending-request (pending-request req now #(on-cancel-request this req))]
       (trace this trace/sending-request req now)
@@ -244,7 +256,7 @@
       (async/>!! output-ch req)
       pending-request))
   (send-notification [this method body]
-    (let [now (.instant clock)
+    (let [now (protocols/instant clock)
           notif (lsp.requests/notification method body)]
       (trace this trace/sending-notification notif now)
       ;; respect back pressure from clients that are slow to read; (go (>!)) will not suffice
@@ -252,7 +264,7 @@
       nil))
   (receive-response [this {:keys [id error result] :as resp}]
     (try
-      (let [now (.instant clock)
+      (let [now (protocols/instant clock)
             [pending-requests _] (swap-vals! pending-sent-requests* dissoc id)]
         (if-let [{:keys [p request started] :as req} (get pending-requests id)]
           (do
@@ -274,7 +286,7 @@
       (catch Throwable e
         (log-error-receiving this e resp))))
   (receive-request [this context {:keys [id method params] :as req}]
-    (let [started (.instant clock)
+    (let [started (protocols/instant clock)
           resp (lsp.responses/response id)]
       (try
         (trace this trace/received-request req started)
@@ -287,7 +299,7 @@
                 (fn [result]
                   (if (identical? ::method-not-found result)
                     (do
-                      (protocols.endpoint/log this :warn "received unexpected request" method)
+                      (protocols/log this :warn "received unexpected request" method)
                       (lsp.responses/error resp (lsp.errors/not-found method)))
                     (lsp.responses/infer resp result))))
               ;; Handle
@@ -303,18 +315,18 @@
               (p/finally
                 (fn [resp _error]
                   (swap! pending-received-requests* dissoc id)
-                  (trace this trace/sending-response req resp started (.instant clock))
+                  (trace this trace/sending-response req resp started (protocols/instant clock))
                   (async/>!! output-ch resp)))))
         (catch Throwable e ;; exceptions thrown by receive-request
           (log-error-receiving this e req)
           (async/>!! output-ch (internal-error-response resp req))))))
   (receive-notification [this context {:keys [method params] :as notif}]
     (try
-      (let [now (.instant clock)]
+      (let [now (protocols/instant clock)]
         (trace this trace/received-notification notif now)
         (let [result (handle-notification this context notif)]
           (when (identical? ::method-not-found result)
-            (protocols.endpoint/log this :warn "received unexpected notification" method))))
+            (protocols/log this :warn "received unexpected notification" method))))
       (catch Throwable e
         (log-error-receiving this e notif)))))
 
@@ -322,7 +334,7 @@
   (update server :tracer* reset! (trace/tracer-for-level trace-level)))
 
 ;; Let language servers implement their own message receivers. These are
-;; slightly different from the identically named protocols.endpoint versions, in
+;; slightly different from the identically named protocols versions, in
 ;; that they receive the message params, not the whole message.
 
 (defmulti receive-request (fn [method _context _params] method))
@@ -334,7 +346,7 @@
 (defn chan-server
   [{:keys [output-ch input-ch log-ch trace? trace-level trace-ch clock on-close
            response-executor on-cancel-request handle-request handle-notification]
-    :or {clock (java.time.Clock/systemDefaultZone)
+    :or {clock (build-default-clock)
          on-close (constantly nil)
          response-executor :default}}]
   (let [;; before defaulting trace-ch, so that default is "off"
@@ -346,7 +358,7 @@
         on-cancel-request
         (or on-cancel-request
             (fn [server {:keys [id]}]
-              (protocols.endpoint/send-notification
+              (protocols/send-notification
                 server "$/cancelRequest" {:id id})))
         handle-request
         (or handle-request
@@ -360,7 +372,7 @@
                 (if-let [pending-req (get @(:pending-received-requests* server) (:id params))]
                   (p/cancel! pending-req)
                   (trace server trace/received-unmatched-cancellation-notification notif
-                         (.instant ^java.time.Clock (:clock server))))
+                         (protocols/instant (:clock server))))
                 (receive-notification method context params))))]
     (map->ChanServer
       {:output-ch output-ch
