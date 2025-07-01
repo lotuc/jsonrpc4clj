@@ -16,3 +16,6 @@
 (defprotocol IInstant
   (to-epoch-milli [_])
   (truncate-to-millis-iso-string [_]))
+
+(defprotocol IGenId
+  (gen-id [_]))

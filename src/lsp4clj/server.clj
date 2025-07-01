@@ -31,6 +31,10 @@
   (to-epoch-milli [v] (.toEpochMilli v))
   (truncate-to-millis-iso-string [v] (str (.truncatedTo v java.time.temporal.ChronoUnit/MILLIS))))
 
+(defrecord GenIntId [id*]
+  protocols/IGenId
+  (gen-id [_] (swap! id* inc)))
+
 (defn build-default-clock []
   (java.time.Clock/systemDefaultZone))
 
@@ -150,7 +154,7 @@
   (when-let [trace-body (apply trace-f @tracer* params)]
     (async/put! trace-ch [:debug trace-body])))
 
-(defrecord PendingReceivedRequest [result-promise cancelled?]
+(defrecord PendingReceivedRequest [result-promise request cancelled?]
   p.protocols/ICancellable
   (-cancel! [_]
     (p/cancel! result-promise)
@@ -165,7 +169,10 @@
         result-promise (p/promise (handle-request server context req))]
     (map->PendingReceivedRequest
       {:result-promise result-promise
+       :request req
        :cancelled? cancelled?})))
+
+(def ^:dynamic *send-advice* identity)
 
 (defrecord ChanServer [input-ch
                        output-ch
@@ -244,9 +251,9 @@
   (log [_this level arg1 arg2]
     (async/put! log-ch [level arg1 arg2]))
   (send-request [this method body]
-    (let [id (swap! request-id* inc)
+    (let [id (protocols/gen-id request-id*)
           now (protocols/instant clock)
-          req (lsp.requests/request id method body)
+          req (vary-meta (lsp.requests/request id method body) *send-advice*)
           pending-request (pending-request req now #(on-cancel-request this req))]
       (trace this trace/sending-request req now)
       ;; Important: record request before sending it, so it's sure to be
@@ -257,7 +264,7 @@
       pending-request))
   (send-notification [this method body]
     (let [now (protocols/instant clock)
-          notif (lsp.requests/notification method body)]
+          notif (vary-meta (lsp.requests/notification method body) *send-advice*)]
       (trace this trace/sending-notification notif now)
       ;; respect back pressure from clients that are slow to read; (go (>!)) will not suffice
       (async/>!! output-ch notif)
@@ -343,6 +350,19 @@
 (defmethod receive-request :default [_method _context _params] ::method-not-found)
 (defmethod receive-notification :default [_method _context _params] ::method-not-found)
 
+(defn on-cancel-send-cancelRequest
+  "https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#cancelRequest"
+  [server {:keys [id]}]
+  (protocols/send-notification server "$/cancelRequest" {:id id}))
+
+(defn on-notification-cancelRequest
+  "https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#cancelRequest"
+  [server _context {:keys [params] :as notif}]
+  (if-let [pending-req (get @(:pending-received-requests* server) (:id params))]
+    (p/cancel! pending-req)
+    (let [now (protocols/instant (:clock server))]
+      (trace server trace/received-unmatched-cancellation-notification notif now))))
+
 (defn chan-server
   [{:keys [output-ch input-ch log-ch trace? trace-level trace-ch clock on-close
            response-executor on-cancel-request handle-request handle-notification]
@@ -357,9 +377,7 @@
         trace-ch (or trace-ch (async/chan (async/sliding-buffer 20)))
         on-cancel-request
         (or on-cancel-request
-            (fn [server {:keys [id]}]
-              (protocols/send-notification
-                server "$/cancelRequest" {:id id})))
+            on-cancel-send-cancelRequest)
         handle-request
         (or handle-request
             (fn [_server context {:keys [method params]}]
@@ -369,10 +387,7 @@
             (fn [server context {:keys [method params] :as notif}]
               (case method
                 "$/cancelRequest"
-                (if-let [pending-req (get @(:pending-received-requests* server) (:id params))]
-                  (p/cancel! pending-req)
-                  (trace server trace/received-unmatched-cancellation-notification notif
-                         (protocols/instant (:clock server))))
+                (on-notification-cancelRequest server context notif)
                 (receive-notification method context params))))]
     (map->ChanServer
       {:output-ch output-ch
@@ -383,7 +398,7 @@
        :clock clock
        :on-close on-close
        :response-executor response-executor
-       :request-id* (atom 0)
+       :request-id* (GenIntId. (atom 0))
        :pending-sent-requests* (atom {})
        :pending-received-requests* (atom {})
        :join (promise)
