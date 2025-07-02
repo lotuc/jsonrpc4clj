@@ -63,7 +63,7 @@
 (defprotocol IBlockingDerefOrCancel
   (deref-or-cancel [this timeout-ms timeout-val]))
 
-#?(:clj (defrecord PendingRequest [p request started cancelled? on-cancel]
+#?(:clj (defrecord PendingRequest [p request response started cancelled? on-cancel]
           clojure.lang.IDeref
           (deref [_] (deref p))
           clojure.lang.IBlockingDeref
@@ -92,7 +92,7 @@
             (p/cancelled? p))
           p.protocols/IPromiseFactory
           (-promise [_] p))
-   :cljs (defrecord PendingRequest [p request started cancelled? on-cancel]
+   :cljs (defrecord PendingRequest [p request response started cancelled? on-cancel]
            IBlockingDerefOrCancel
            (deref-or-cancel [this timeout-ms timeout-val]
              (let [p' (resolve-ex-data p)]
@@ -143,7 +143,7 @@
     ;; Currently, PendingRequest's cancellation delegates to
     ;; java.util.concurrent.Future, which implements the
     ;; `promesa.protocols/ICancellable`
-    (map->PendingRequest {:p p :request request :started started
+    (map->PendingRequest {:p p :request request :response (p/deferred) :started started
                           :cancelled? cancelled? :on-cancel on-cancel*})))
 
 (defn ^:private format-error-code [description error-code]
@@ -335,7 +335,7 @@
     (try
       (let [now (protocols/instant clock)
             [pending-requests _] (swap-vals! pending-sent-requests* dissoc id)]
-        (if-let [{:keys [p request started] :as req} (get pending-requests id)]
+        (if-let [{:keys [p request response started] :as req} (get pending-requests id)]
           (do
             (trace this trace/received-response request resp started now)
             ;; Note that we are called from the server's pipeline, a core.async
@@ -349,8 +349,11 @@
             (p.exec/submit! response-executor
                             (fn []
                               (if error
-                                (p/reject! p (ex-info "Received error response" resp))
-                                (p/resolve! p result)))))
+                                (let [e (ex-info "Received error response" resp)]
+                                  (p/reject! p e)
+                                  (p/reject! response e))
+                                (do (p/resolve! p result)
+                                    (p/resolve! response resp))))))
           (trace this trace/received-unmatched-response resp now)))
       (catch #?(:clj Throwable :cljs :default) e
         (log-error-receiving this e resp))))
@@ -385,15 +388,17 @@
                 (fn [resp _error]
                   (swap! pending-received-requests* dissoc id)
                   (trace this trace/sending-response req resp started (protocols/instant clock))
-                  #?(:clj (async/>!! output-ch resp)
-                     :cljs (async/go (async/>! output-ch resp)))))))
+                  (let [resp (vary-meta resp assoc :request req)]
+                    #?(:clj (async/>!! output-ch resp)
+                       :cljs (async/go (async/>! output-ch resp))))))))
         (catch #?(:clj Throwable :cljs :default) e ;; exceptions thrown by receive-request
           (log-error-receiving this e req)
-          #?(:clj (async/>!! output-ch (internal-error-response resp req))
-             :cljs (let [p (p/deferred)]
-                     (async/go
-                       (p/resolve! p (async/>! output-ch (internal-error-response resp req))))
-                     p))))))
+          (let [resp (vary-meta (internal-error-response resp req) assoc :request req)]
+            #?(:clj (async/>!! output-ch resp)
+               :cljs (let [p (p/deferred)]
+                       (async/go
+                         (p/resolve! p (async/>! output-ch resp)))
+                       p)))))))
   (receive-notification [this context {:keys [method params] :as notif}]
     (try
       (let [now (protocols/instant clock)]

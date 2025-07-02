@@ -86,6 +86,54 @@
           (p/handle (fn [v _] (is (= {:processed true} v))))
           (p/finally (fn [_ _] (server/shutdown server) (done)))))))
 
+(deftest should-passes-jsonrpc-message-metadata-around
+  (t/async
+    done
+
+    (let [input-ch (async/chan 3)
+          output-ch (async/chan 3)
+          server (server/chan-server
+                   {:output-ch output-ch
+                    :input-ch input-ch
+                    :handle-request (fn [_ _ _] "hello")})
+          _ (server/start server nil)]
+
+      (-> (binding [server/*send-advice* (fn [m] (assoc m :key0 "val0"))]
+            (server/send-request server "req" {:body "foo"}))
+          (p/handle
+            (fn [req _]
+              (-> (h/assert-take output-ch)
+                ;; we can attach metadata to jsonrpc request
+                  (p/handle (fn [client-rcvd-msg _]
+                              (is (= "val0" (:key0 (meta client-rcvd-msg))))
+                              (:id client-rcvd-msg)))
+                ;; can also attach metadata on jsonrpc response
+                  (p/handle (fn [id _]
+                              (async/put! input-ch
+                                          (vary-meta
+                                            (lsp.responses/response id {:processed true})
+                                            #(assoc % :key1 "val1")))))
+                  (p/handle (fn [_ _]
+                              (server/deref-or-cancel req 1000 :test-timeout)))
+                  (p/handle (fn [v _]
+                              (is (= {:processed true} v))
+                              (is (p/done? (:response req)))
+                              (is (= "val1" (:key1 (meta @(:response req))))))))))
+
+          ;; the jsonrpc response's metadata contains the jsonrpc request
+          (p/handle (fn [_ _]
+                      (let [request (vary-meta
+                                      (lsp.requests/request 42 "foo" "bar")
+                                      #(assoc % :key3 "val3"))]
+                        (async/put! input-ch request)
+                        (-> (h/assert-take output-ch)
+                            (p/handle (fn [v _]
+                                        (is (= {:jsonrpc "2.0", :id 42, :result "hello"} v))
+                                        (is (= request (:request (meta v))))
+                                        ;; preserves the metadata
+                                        (is (= "val3" (:key3 (meta (:request (meta v))))))))))))
+          (p/finally (fn [_ _] (server/shutdown server) (done)))))))
+
 (deftest should-respond-to-requests
   (t/async
     done
@@ -573,4 +621,3 @@
                                        v)))))))
 
             (p/finally (fn [_ _] (server/shutdown server) (done))))))))
-
