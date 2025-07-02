@@ -1,5 +1,8 @@
 (ns lsp4clj.server
   (:require
+   #?(:cljs [goog.string :refer [format]])
+   #?(:cljs [goog.string.format])
+   #?(:cljs [promesa.impl.promise :as pimpl])
    [clojure.core.async :as async]
    [clojure.pprint :as pprint]
    [lsp4clj.coercer :as coercer]
@@ -12,85 +15,130 @@
    [promesa.exec :as p.exec]
    [promesa.protocols :as p.protocols])
   (:import
-   (java.util.concurrent CancellationException)))
+   #?(:clj (java.util.concurrent CancellationException))))
 
-(set! *warn-on-reflection* true)
+(defn kw-identical? [a b]
+  #?(:clj (identical? a b)
+     :cljs (cljs.core/keyword-identical? a b)))
+
+#?(:clj (set! *warn-on-reflection* true))
+
+#?(:cljs (defrecord CancellationException []))
 
 (defn- cancellation-exception? [e]
-  (instance? CancellationException e))
+  (or (instance? CancellationException e)
+      #?(:cljs (pimpl/isCancellationError e))))
 
 (defn- resolve-ex-data [p]
   (p/catch p (fn [ex] (or (ex-data ex) (p/rejected ex)))))
 
-(extend-type java.time.Clock
-  protocols/IClock
-  (instant [v] (.instant v)))
+#?(:clj (extend-type java.time.Clock
+          protocols/IClock
+          (instant [v] (.instant v))))
 
-(extend-type java.time.Instant
-  protocols/IInstant
-  (to-epoch-milli [v] (.toEpochMilli v))
-  (truncate-to-millis-iso-string [v] (str (.truncatedTo v java.time.temporal.ChronoUnit/MILLIS))))
+#?(:clj (extend-type java.time.Instant
+          protocols/IInstant
+          (to-epoch-milli [v] (.toEpochMilli v))
+          (truncate-to-millis-iso-string [v] (str (.truncatedTo v java.time.temporal.ChronoUnit/MILLIS)))))
+
+#?(:cljs (extend-type js/Date
+           ;; the constant clock
+           protocols/IClock
+           (instant [v] v)
+           protocols/IInstant
+           (to-epoch-milli [v] (.getTime v))
+           (truncate-to-millis-iso-string [v] (.toISOString v))))
+#?(:cljs (defrecord SystemClock []
+           protocols/IClock
+           (instant [_] (js/Date.))))
 
 (defrecord GenIntId [id*]
   protocols/IGenId
   (gen-id [_] (swap! id* inc)))
 
 (defn build-default-clock []
-  (java.time.Clock/systemDefaultZone))
+  #?(:clj (java.time.Clock/systemDefaultZone)
+     :cljs (SystemClock.)))
 
 (defprotocol IBlockingDerefOrCancel
   (deref-or-cancel [this timeout-ms timeout-val]))
 
-(defrecord PendingRequest [p request started cancelled? on-cancel]
-  clojure.lang.IDeref
-  (deref [_] (deref p))
-  clojure.lang.IBlockingDeref
-  (deref [_ timeout-ms timeout-val]
-    (deref (resolve-ex-data p) timeout-ms timeout-val))
-  IBlockingDerefOrCancel
-  (deref-or-cancel [this timeout-ms timeout-val]
-    (let [result (deref (resolve-ex-data p) timeout-ms ::timeout)]
-      (if (identical? ::timeout result)
-        (do (p/cancel! this)
-            timeout-val)
-        result)))
-  clojure.lang.IPending
-  (isRealized [_] (p/done? p))
-  java.util.concurrent.Future
-  (get [_] (deref p))
-  (get [_ timeout unit]
-    (let [result (deref p (.toMillis unit timeout) ::timeout)]
-      (if (identical? ::timeout result)
-        (throw (java.util.concurrent.TimeoutException.))
-        result)))
-  (isCancelled [_] @cancelled?)
-  (isDone [_] (p/done? p))
-  (cancel [_ _interrupt?]
-    (p/cancel! p)
-    (p/cancelled? p))
-  p.protocols/IPromiseFactory
-  (-promise [_] p))
+#?(:clj (defrecord PendingRequest [p request started cancelled? on-cancel]
+          clojure.lang.IDeref
+          (deref [_] (deref p))
+          clojure.lang.IBlockingDeref
+          (deref [_ timeout-ms timeout-val]
+            (deref (resolve-ex-data p) timeout-ms timeout-val))
+          IBlockingDerefOrCancel
+          (deref-or-cancel [this timeout-ms timeout-val]
+            (let [result (deref (resolve-ex-data p) timeout-ms ::timeout)]
+              (if (identical? ::timeout result)
+                (do (p/cancel! this)
+                    timeout-val)
+                result)))
+          clojure.lang.IPending
+          (isRealized [_] (p/done? p))
+          java.util.concurrent.Future
+          (get [_] (deref p))
+          (get [_ timeout unit]
+            (let [result (deref p (.toMillis unit timeout) ::timeout)]
+              (if (identical? ::timeout result)
+                (throw (java.util.concurrent.TimeoutException.))
+                result)))
+          (isCancelled [_] @cancelled?)
+          (isDone [_] (p/done? p))
+          (cancel [_ _interrupt?]
+            (p/cancel! p)
+            (p/cancelled? p))
+          p.protocols/IPromiseFactory
+          (-promise [_] p))
+   :cljs (defrecord PendingRequest [p request started cancelled? on-cancel]
+           IBlockingDerefOrCancel
+           (deref-or-cancel [this timeout-ms timeout-val]
+             (let [p' (resolve-ex-data p)]
+               (-> (p/timeout p' timeout-ms)
+                   (p/handle (fn [v e]
+                               (if e
+                                 (if (and (instance? p/TimeoutException e)
+                                          (not (p/done? p')))
+                                   (do (p/cancel! this) timeout-val)
+                                   (throw e))
+                                 v))))))
+           p.protocols/ICancellable
+           (-cancel! [_]
+             (when-not (p/done? p)
+               (try (on-cancel) (catch :default _ nil))
+               (reset! cancelled? true)))
+           (-cancelled? [_]
+             @cancelled?)
 
-;; Avoid error: java.lang.IllegalArgumentException: Multiple methods in multimethod 'simple-dispatch' match dispatch value: class lsp4clj.server.PendingRequest -> interface clojure.lang.IPersistentMap and interface clojure.lang.IDeref, and neither is preferred
-;; Only when CIDER is running? See https://github.com/thi-ng/color/issues/10
-;; Also see https://github.com/babashka/process/commit/e46a5f3e42321b3ecfda960b7b248a888b44aa3b
+           p.protocols/IPromiseFactory
+           (-promise [_] p)
+           p.protocols/IState
+           (-extract [_] (p.protocols/-extract p))
+           (-resolved? [_] (p.protocols/-resolved? p))
+           (-rejected? [_] (p.protocols/-rejected? p))
+           (-pending? [_] (p.protocols/-pending? p))))
+
 (defmethod pprint/simple-dispatch PendingRequest [{:keys [request started]}]
   (pprint/pprint {:request (select-keys request [:id :method]) :started started}))
 
-(prefer-method print-method java.util.Map clojure.lang.IDeref)
+;;; https://github.com/thi-ng/color/issues/10
+#?(:clj (prefer-method print-method java.util.Map clojure.lang.IDeref))
 
 (defn pending-request
   [request started on-cancel]
   (let [p (p/deferred)
         cancelled? (atom false)
-        on-cancel* #(when-not (first (reset-vals! cancelled? true)) (on-cancel))]
-    (p/catch p cancellation-exception? (fn [_] (on-cancel*)))
+        on-cancel* #(do #?(:cljs (p/reject! p (CancellationException.)))
+                        (when-not (first (reset-vals! cancelled? true)) (on-cancel)))]
 
     ;; Add cancellation callback to PendingRequest for ClojureScript migration.
     ;; ClojureScript's promesa promise does not support cancellation.
 
     ;; To avoid leak (someone cancel on the `p` field), we still register the
     ;; callback onto `p`.
+    #?(:clj (p/catch p cancellation-exception? (fn [_] (on-cancel*))))
 
     ;; Currently, PendingRequest's cancellation delegates to
     ;; java.util.concurrent.Future, which implements the
@@ -109,14 +157,21 @@
 
 (defn thread-loop [buf-or-n f]
   (let [ch (async/chan buf-or-n)]
-    (async/thread
-      (loop []
-        (when-let [arg (async/<!! ch)]
-          (f arg)
-          (recur))))
+    #?(:clj
+       (async/thread
+         (loop []
+           (when-let [arg (async/<!! ch)]
+             (f arg)
+             (recur))))
+       :cljs
+       (async/go
+         (loop []
+           (when-let [arg (async/<! ch)]
+             (f arg)
+             (recur)))))
     ch))
 
-(def input-buffer-size
+(def +input-buffer-size+
   ;; (Jacob Maine): This number is picked out of thin air. I have no idea how to
   ;; estimate how big the buffer could or should be. LSP communication tends to
   ;; be very quiet, then very chatty, so it depends a lot on what the client and
@@ -183,7 +238,8 @@
                        join
                        on-cancel-request
                        handle-request
-                       handle-notification]
+                       handle-notification
+                       input-buffer-size]
   protocols/IEndpoint
   (start [this context]
     ;; Start receiving messages.
@@ -191,7 +247,7 @@
           (thread-loop
             input-buffer-size
             (fn [[message-type message]]
-              (if (identical? :request message-type)
+              (if (kw-identical? :request message-type)
                 (protocols/receive-request this context message)
                 (protocols/receive-notification this context message))))
 
@@ -232,7 +288,8 @@
         (async/close! log-ch)
         (some-> trace-ch async/close!)
         (on-close)
-        (deliver join :done)))
+        #?(:clj (deliver join :done)
+           :cljs (p/resolve! join :done))))
     ;; invokers can deref the return of `start` to stay alive until server is
     ;; shut down
     join)
@@ -240,7 +297,8 @@
     ;; Closing input-ch will drain pipeline then close it which, in turn,
     ;; triggers additional cleanup.
     (async/close! input-ch)
-    (deref join 10e3 :timeout))
+    #?(:clj (deref join 10e3 :timeout)
+       :cljs (p/timeout join 10e3 :done)))
   (log [_this level arg1]
     (async/put! log-ch [level arg1]))
   (log [_this level arg1 arg2]
@@ -255,15 +313,24 @@
       ;; available during receive-response.
       (swap! pending-sent-requests* assoc id pending-request)
       ;; respect back pressure from clients that are slow to read; (go (>!)) will not suffice
-      (async/>!! output-ch req)
-      pending-request))
+      #?(:clj (do
+                (async/>!! output-ch req)
+                pending-request)
+         :cljs (let [p (p/deferred)]
+                 (async/go (async/>! output-ch req)
+                           (p/resolve! p :done))
+                 (p/then p (fn [_] pending-request))))))
   (send-notification [this method body]
     (let [now (protocols/instant clock)
           notif (vary-meta (lsp.requests/notification method body) *send-advice*)]
       (trace this trace/sending-notification notif now)
       ;; respect back pressure from clients that are slow to read; (go (>!)) will not suffice
-      (async/>!! output-ch notif)
-      nil))
+      #?(:clj (do (async/>!! output-ch notif)
+                  nil)
+         :cljs (let [p (p/deferred)]
+                 (async/go (async/>! output-ch notif)
+                           (p/resolve! p nil))
+                 p))))
   (receive-response [this {:keys [id error result] :as resp}]
     (try
       (let [now (protocols/instant clock)
@@ -285,7 +352,7 @@
                                 (p/reject! p (ex-info "Received error response" resp))
                                 (p/resolve! p result)))))
           (trace this trace/received-unmatched-response resp now)))
-      (catch Throwable e
+      (catch #?(:clj Throwable :cljs :default) e
         (log-error-receiving this e resp))))
   (receive-request [this context {:keys [id method params] :as req}]
     (let [started (protocols/instant clock)
@@ -299,7 +366,7 @@
               ;; convert result/error to response
               (p/then
                 (fn [result]
-                  (if (identical? ::method-not-found result)
+                  (if (kw-identical? ::method-not-found result)
                     (do
                       (protocols/log this :warn "received unexpected request" method)
                       (lsp.responses/error resp (lsp.errors/not-found method)))
@@ -318,18 +385,23 @@
                 (fn [resp _error]
                   (swap! pending-received-requests* dissoc id)
                   (trace this trace/sending-response req resp started (protocols/instant clock))
-                  (async/>!! output-ch resp)))))
-        (catch Throwable e ;; exceptions thrown by receive-request
+                  #?(:clj (async/>!! output-ch resp)
+                     :cljs (async/go (async/>! output-ch resp)))))))
+        (catch #?(:clj Throwable :cljs :default) e ;; exceptions thrown by receive-request
           (log-error-receiving this e req)
-          (async/>!! output-ch (internal-error-response resp req))))))
+          #?(:clj (async/>!! output-ch (internal-error-response resp req))
+             :cljs (let [p (p/deferred)]
+                     (async/go
+                       (p/resolve! p (async/>! output-ch (internal-error-response resp req))))
+                     p))))))
   (receive-notification [this context {:keys [method params] :as notif}]
     (try
       (let [now (protocols/instant clock)]
         (trace this trace/received-notification notif now)
         (let [result (handle-notification this context notif)]
-          (when (identical? ::method-not-found result)
+          (when (kw-identical? ::method-not-found result)
             (protocols/log this :warn "received unexpected notification" method))))
-      (catch Throwable e
+      (catch #?(:clj Throwable :cljs :default) e
         (log-error-receiving this e notif)))))
 
 (defn set-trace-level [server trace-level]
@@ -360,7 +432,8 @@
 
 (defn chan-server
   [{:keys [output-ch input-ch log-ch trace? trace-level trace-ch clock on-close
-           response-executor on-cancel-request handle-request handle-notification]
+           response-executor on-cancel-request handle-request handle-notification
+           input-buffer-size]
     :or {clock (build-default-clock)
          on-close (constantly nil)
          response-executor :default}}]
@@ -396,7 +469,8 @@
        :request-id* (GenIntId. (atom 0))
        :pending-sent-requests* (atom {})
        :pending-received-requests* (atom {})
-       :join (promise)
+       :join #?(:clj (promise) :cljs (p/deferred))
        :handle-request handle-request
        :handle-notification handle-notification
-       :on-cancel-request on-cancel-request})))
+       :on-cancel-request on-cancel-request
+       :input-buffer-size (or input-buffer-size +input-buffer-size+)})))

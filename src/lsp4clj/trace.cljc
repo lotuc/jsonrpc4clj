@@ -1,9 +1,11 @@
 (ns lsp4clj.trace
   (:require
-   [cheshire.core :as json]
+   #?(:clj [cheshire.core :as json])
+   #?(:cljs [goog.string :refer [format]])
+   #?(:cljs [goog.string.format])
    [lsp4clj.protocols :as protocols]))
 
-(set! *warn-on-reflection* true)
+#?(:clj (set! *warn-on-reflection* true))
 
 (defn ^:private format-tag [at]
   (format "[Trace - %s]" (protocols/truncate-to-millis-iso-string at)))
@@ -15,7 +17,8 @@
   (format "'%s'" method))
 
 (defn ^:private format-body [label body]
-  (str label ": " (json/generate-string body {:pretty true})))
+  (str label ": " #?(:clj (json/generate-string body {:pretty true})
+                     :cljs (js/JSON.stringify (clj->js body) nil 2))))
 
 (defn ^:private format-params [{:keys [params]}]
   (format-body "Params" params))

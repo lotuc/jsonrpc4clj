@@ -2,7 +2,7 @@
   (:require
    [clojure.spec.alpha :as s]))
 
-(set! *warn-on-reflection* true)
+#?(:clj (set! *warn-on-reflection* true))
 
 (s/def :json-rpc.message/jsonrpc #{"2.0"})
 (s/def :json-rpc.message/method string?)
