@@ -204,7 +204,7 @@
   (when-let [trace-body (apply trace-f @tracer* params)]
     (async/put! trace-ch [:debug trace-body])))
 
-(defrecord PendingReceivedRequest [result-promise request cancelled?]
+(defrecord PendingReceivedRequest [result-promise request cancelled? started]
   p.protocols/ICancellable
   (-cancel! [_]
     (p/cancel! result-promise)
@@ -212,7 +212,8 @@
   (-cancelled? [_]
     @cancelled?))
 
-(defn pending-received-request [{:keys [handle-request] :as server} context req]
+(defn pending-received-request
+  [{:keys [handle-request] :as server} context req started]
   (let [cancelled? (atom false)
         ;; coerce result/error to promise
         context (assoc context ::req-cancelled? cancelled?)
@@ -220,6 +221,7 @@
     (map->PendingReceivedRequest
       {:result-promise result-promise
        :request req
+       :started started
        :cancelled? cancelled?})))
 
 (def ^:dynamic *send-advice* identity)
@@ -362,7 +364,7 @@
           resp (lsp.responses/response id)]
       (try
         (trace this trace/received-request req started)
-        (let [pending-req (pending-received-request this context req)]
+        (let [pending-req (pending-received-request this context req started)]
           (protocols/-save-received! pending-received-requests* pending-req)
           (-> pending-req
               :result-promise
