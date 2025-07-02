@@ -24,3 +24,7 @@ output.calva-repl
 /reports
 
 /.lh
+
+.shadow-cljs
+!public/index.html
+/public

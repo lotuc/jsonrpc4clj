@@ -1,0 +1,14 @@
+{:deps {:aliases [:dev :cljs]}
+ :dev-http {8080 "public"}
+ :builds
+ {:frontend
+  {:target :browser
+   :modules {:main {:init-fn lsp4clj.cljs-tests/init}}}
+  :browser-test
+  {:target :browser-test
+   :test-dir "out/test"}
+  :node-test
+  {:target :node-test
+   :output-to "out/node-tests.js"
+   :ns-regexp "-test$"
+   :autorun true}}}

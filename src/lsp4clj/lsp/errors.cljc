@@ -1,6 +1,6 @@
 (ns lsp4clj.lsp.errors)
 
-(set! *warn-on-reflection* true)
+#?(:clj (set! *warn-on-reflection* true))
 
 (def by-key
   ;; https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#errorCodes

@@ -3,7 +3,7 @@
    [camel-snake-kebab.core :as csk]
    [camel-snake-kebab.extras :as cske]))
 
-(set! *warn-on-reflection* true)
+#?(:clj (set! *warn-on-reflection* true))
 
 (defn response
   "Create a JSON-RPC response object. A response should be extend with a

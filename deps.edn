@@ -12,4 +12,5 @@
                    :deps {io.github.clojure/tools.build {:git/tag "v0.8.1"
                                                          :git/sha "7d40500"}
                           slipset/deps-deploy {:mvn/version "0.2.0"}}
-                   :ns-default build}}}
+                   :ns-default build}
+           :cljs {:extra-deps {thheller/shadow-cljs {:mvn/version "3.1.7"}}}}}

@@ -1,6 +1,6 @@
 (ns lsp4clj.lsp.requests)
 
-(set! *warn-on-reflection* true)
+#?(:clj (set! *warn-on-reflection* true))
 
 (defn request [id method params]
   {:jsonrpc "2.0"
