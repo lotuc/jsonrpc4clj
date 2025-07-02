@@ -19,3 +19,14 @@
 
 (defprotocol IGenId
   (gen-id [_]))
+
+(defprotocol IPendingReceivedRequestStore
+  (-save-received! [_ pending-req])
+  (-remove-received! [_ jsonrpc-req])
+  (-get-by-jsonrpc-request-or-notification [_ jsonrpc-req])
+  (-seq-received [_]))
+
+(defprotocol IPendingSentRequestStore
+  (-save-sent! [_ pending-req])
+  (-remove-sent-by-resp! [_ jsonrpc-resp])
+  (-seq-sent [_]))
