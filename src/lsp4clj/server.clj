@@ -41,17 +41,17 @@
 (defprotocol IBlockingDerefOrCancel
   (deref-or-cancel [this timeout-ms timeout-val]))
 
-(defrecord PendingRequest [p request started]
+(defrecord PendingRequest [p request started cancelled? on-cancel]
   clojure.lang.IDeref
   (deref [_] (deref p))
   clojure.lang.IBlockingDeref
   (deref [_ timeout-ms timeout-val]
     (deref (resolve-ex-data p) timeout-ms timeout-val))
   IBlockingDerefOrCancel
-  (deref-or-cancel [_ timeout-ms timeout-val]
+  (deref-or-cancel [this timeout-ms timeout-val]
     (let [result (deref (resolve-ex-data p) timeout-ms ::timeout)]
       (if (identical? ::timeout result)
-        (do (p/cancel! p)
+        (do (p/cancel! this)
             timeout-val)
         result)))
   clojure.lang.IPending
@@ -63,7 +63,7 @@
       (if (identical? ::timeout result)
         (throw (java.util.concurrent.TimeoutException.))
         result)))
-  (isCancelled [_] (p/cancelled? p))
+  (isCancelled [_] @cancelled?)
   (isDone [_] (p/done? p))
   (cancel [_ _interrupt?]
     (p/cancel! p)
@@ -80,28 +80,23 @@
 (prefer-method print-method java.util.Map clojure.lang.IDeref)
 
 (defn pending-request
-  "Returns an object representing a pending JSON-RPC request to a remote
-  endpoint. Deref the object to get the response.
-
-  Most of the time, you should call `lsp4clj.server/deref-or-cancel` on the
-  object. This has the same signature as `clojure.core/deref` with a timeout. If
-  the client produces a response, will return it, but if the timeout is reached
-  will cancel the request by sending a `$/cancelRequest` notification to the
-  client.
-
-  Otherwise, the object presents the same interface as `future`. Responds to
-  `future-cancel` (which sends `$/cancelRequest`), `realized?`, `future?`
-  `future-done?` and `future-cancelled?`.
-
-  If the request is cancelled, future invocations of `deref` will return
-  `:lsp4clj.server/cancelled`.
-
-  Sends `$/cancelRequest` only once, though `lsp4clj.server/deref-or-cancel` or
-  `future-cancel` can be called multiple times."
   [request started on-cancel]
-  (let [p (p/deferred)]
-    (p/catch p cancellation-exception? (fn [_] (on-cancel)))
-    (map->PendingRequest {:p p :request request :started started})))
+  (let [p (p/deferred)
+        cancelled? (atom false)
+        on-cancel* #(when-not (first (reset-vals! cancelled? true)) (on-cancel))]
+    (p/catch p cancellation-exception? (fn [_] (on-cancel*)))
+
+    ;; Add cancellation callback to PendingRequest for ClojureScript migration.
+    ;; ClojureScript's promesa promise does not support cancellation.
+
+    ;; To avoid leak (someone cancel on the `p` field), we still register the
+    ;; callback onto `p`.
+
+    ;; Currently, PendingRequest's cancellation delegates to
+    ;; java.util.concurrent.Future, which implements the
+    ;; `promesa.protocols/ICancellable`
+    (map->PendingRequest {:p p :request request :started started
+                          :cancelled? cancelled? :on-cancel on-cancel*})))
 
 (defn ^:private format-error-code [description error-code]
   (let [{:keys [code message]} (lsp.errors/by-key error-code)]
