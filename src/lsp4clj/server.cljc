@@ -233,13 +233,20 @@
                        response-executor
                        on-close
                        request-id*
-                       pending-sent-requests*
-                       pending-received-requests*
                        join
                        on-cancel-request
                        handle-request
                        handle-notification
-                       input-buffer-size]
+                       input-buffer-size
+
+                       pending-received-requests*
+                       save-pending-received-request!
+                       remove-pending-received-request!
+
+                       pending-sent-requests*
+                       reject-pending-sent-requests!
+                       save-pending-sent-request!
+                       remove-pending-sent-request!]
   protocols/IEndpoint
   (start [this context]
     ;; Start receiving messages.
@@ -250,12 +257,6 @@
               (if (kw-identical? :request message-type)
                 (protocols/receive-request this context message)
                 (protocols/receive-notification this context message))))
-
-          reject-pending-sent-requests
-          (fn [exception]
-            (doseq [pending-request (vals @pending-sent-requests*)]
-              (p/reject! (:p pending-request)
-                         exception)))
 
           pipeline
           (async/go-loop []
@@ -269,8 +270,8 @@
                   (:request :notification)
                   (when-not (async/offer! client-initiated-in-ch [message-type message])
                     ;; Buffers full. Fail any waiting pending requests and...
-                    (reject-pending-sent-requests
-                      (ex-info "Buffer of client messages exhausted." {}))
+                    (reject-pending-sent-requests!
+                      this (ex-info "Buffer of client messages exhausted." {}))
                     ;; ... try again, but park this time.
                     (async/>! client-initiated-in-ch [message-type message])))
                 (recur))
@@ -281,8 +282,8 @@
         ;; The pipeline has closed, indicating input-ch has closed. We're done
         ;; receiving. Do cleanup.
 
-        (reject-pending-sent-requests
-          (ex-info "Server shutting down. Input is closed so no response is possible." {}))
+        (reject-pending-sent-requests!
+          this (ex-info "Server shutting down. Input is closed so no response is possible." {}))
 
         (async/close! output-ch)
         (async/close! log-ch)
@@ -311,7 +312,7 @@
       (trace this trace/sending-request req now)
       ;; Important: record request before sending it, so it's sure to be
       ;; available during receive-response.
-      (swap! pending-sent-requests* assoc id pending-request)
+      (save-pending-sent-request! this pending-request)
       ;; respect back pressure from clients that are slow to read; (go (>!)) will not suffice
       #?(:clj (do
                 (async/>!! output-ch req)
@@ -333,9 +334,9 @@
                  p))))
   (receive-response [this {:keys [id error result] :as resp}]
     (try
-      (let [now (protocols/instant clock)
-            [pending-requests _] (swap-vals! pending-sent-requests* dissoc id)]
-        (if-let [{:keys [p request response started] :as req} (get pending-requests id)]
+      (let [now (protocols/instant clock)]
+        (if-let [{:keys [p request response started] :as req}
+                 (remove-pending-sent-request! this resp)]
           (do
             (trace this trace/received-response request resp started now)
             ;; Note that we are called from the server's pipeline, a core.async
@@ -363,7 +364,7 @@
       (try
         (trace this trace/received-request req started)
         (let [pending-req (pending-received-request this context req)]
-          (swap! pending-received-requests* assoc id pending-req)
+          (save-pending-received-request! this pending-req)
           (-> pending-req
               :result-promise
               ;; convert result/error to response
@@ -386,7 +387,7 @@
                      (internal-error-response resp req)))))
               (p/finally
                 (fn [resp _error]
-                  (swap! pending-received-requests* dissoc id)
+                  (remove-pending-received-request! this req)
                   (trace this trace/sending-response req resp started (protocols/instant clock))
                   (let [resp (vary-meta resp assoc :request req)]
                     #?(:clj (async/>!! output-ch resp)
@@ -438,7 +439,9 @@
 (defn chan-server
   [{:keys [output-ch input-ch log-ch trace? trace-level trace-ch clock on-close
            response-executor on-cancel-request handle-request handle-notification
-           input-buffer-size]
+           input-buffer-size save-pending-sent-request! remove-pending-sent-request!
+           reject-pending-sent-requests! save-pending-received-request!
+           remove-pending-received-request!]
     :or {clock (build-default-clock)
          on-close (constantly nil)
          response-executor :default}}]
@@ -461,7 +464,41 @@
               (case method
                 "$/cancelRequest"
                 (on-notification-cancelRequest server context notif)
-                (receive-notification method context params))))]
+                (receive-notification method context params))))
+
+        ;; Here we can utilize the attached metadata (user attached metadata on
+        ;; request, or transport implemenetation attached metadata on response).
+
+        pending-received-requests* (atom {})
+        save-pending-received-request!
+        (or save-pending-received-request!
+            (fn [_server pending-req]
+              (swap! pending-received-requests* assoc
+                     (get-in pending-req [:request :id]) pending-req)))
+        remove-pending-received-request!
+        (or remove-pending-received-request!
+            (fn [_server req]
+              (swap! pending-received-requests* dissoc (:id req))))
+        pending-sent-requests* (atom {})
+        ;; Save request before sending
+        save-pending-sent-request!
+        (or save-pending-sent-request!
+            (fn [_server pending-request]
+              (swap! pending-sent-requests* assoc
+                     (get-in pending-request [:request :id])
+                     pending-request)))
+        ;; Get saved request base on received response. SHOULD clear the saved
+        ;; request to avoid handling multiple response for same request.
+        remove-pending-sent-request!
+        (or remove-pending-sent-request!
+            (fn [_server {:keys [id] :as resp}]
+              (let [[pending-requests _] (swap-vals! pending-sent-requests* dissoc id)]
+                (get pending-requests id))))
+        reject-pending-sent-requests!
+        (or reject-pending-sent-requests!
+            (fn [_server exception]
+              (doseq [pending-request (vals @pending-sent-requests*)]
+                (p/reject! (:p pending-request) exception))))]
     (map->ChanServer
       {:output-ch output-ch
        :input-ch input-ch
@@ -472,10 +509,17 @@
        :on-close on-close
        :response-executor response-executor
        :request-id* (GenIntId. (atom 0))
-       :pending-sent-requests* (atom {})
-       :pending-received-requests* (atom {})
        :join #?(:clj (promise) :cljs (p/deferred))
        :handle-request handle-request
        :handle-notification handle-notification
        :on-cancel-request on-cancel-request
-       :input-buffer-size (or input-buffer-size +input-buffer-size+)})))
+       :input-buffer-size (or input-buffer-size +input-buffer-size+)
+
+       :pending-received-requests* pending-received-requests*
+       :save-pending-received-request! save-pending-received-request!
+       :remove-pending-received-request! remove-pending-received-request!
+
+       :pending-sent-requests* (atom {})
+       :reject-pending-sent-requests! reject-pending-sent-requests!
+       :save-pending-sent-request! save-pending-sent-request!
+       :remove-pending-sent-request! remove-pending-sent-request!})))
