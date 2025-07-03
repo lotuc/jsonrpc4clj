@@ -246,13 +246,19 @@
   protocols/IEndpoint
   (start [this context]
     ;; Start receiving messages.
-    (let [client-initiated-in-ch
+    (let [context*
+          (if #?(:clj (instance? clojure.lang.IDeref context)
+                 :cljs (satisfies? cljs.core/IDeref context))
+            #(deref context)
+            #(do context))
+
+          client-initiated-in-ch
           (thread-loop
             input-buffer-size
             (fn [[message-type message]]
               (if (kw-identical? :request message-type)
-                (protocols/receive-request this context message)
-                (protocols/receive-notification this context message))))
+                (protocols/receive-request this (context*) message)
+                (protocols/receive-notification this (context*) message))))
 
           reject-pending-sent-requests!
           (fn [_server exception]
