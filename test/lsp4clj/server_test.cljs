@@ -98,8 +98,9 @@
                     :handle-request (fn [_ _ _] "hello")})
           _ (server/start server nil)]
 
-      (-> (binding [server/*send-advice* (fn [m] (assoc m :key0 "val0"))]
-            (server/send-request server "req" {:body "foo"}))
+      (-> (->> (vary-meta (lsp4clj.lsp.requests/request 42 "req" {:body "foo"})
+                          (fn [m] (assoc m :key0 "val0")))
+               (server/send-request server))
           (p/handle
             (fn [req _]
               (-> (h/assert-take output-ch)

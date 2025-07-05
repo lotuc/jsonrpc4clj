@@ -70,8 +70,9 @@
                   :input-ch input-ch
                   :handle-request (fn [_ _ _] "hello")})
         _ (server/start server nil)
-        req (binding [server/*send-advice* (fn [m] (assoc m :key0 "val0"))]
-              (server/send-request server "req" {:body "foo"}))
+        req (->> (vary-meta (lsp4clj.lsp.requests/request 42 "req" {:body "foo"})
+                            (fn [m] (assoc m :key0 "val0")))
+                 (server/send-request server))
         client-rcvd-msg (h/assert-take output-ch)]
 
     ;; we can attach metadata to jsonrpc request

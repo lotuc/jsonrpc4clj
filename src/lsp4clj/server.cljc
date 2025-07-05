@@ -224,8 +224,6 @@
        :started started
        :cancelled? cancelled?})))
 
-(def ^:dynamic *send-advice* identity)
-
 (defrecord ChanServer [input-ch
                        output-ch
                        log-ch
@@ -311,10 +309,8 @@
     (async/put! log-ch [level arg1]))
   (log [_this level arg1 arg2]
     (async/put! log-ch [level arg1 arg2]))
-  (send-request [this method body]
-    (let [id (protocols/gen-id request-id*)
-          now (protocols/instant clock)
-          req (vary-meta (lsp.requests/request id method body) *send-advice*)
+  (send-request [this req]
+    (let [now (protocols/instant clock)
           pending-request (pending-request req now #(on-cancel-request this req))]
       (trace this trace/sending-request req now)
       ;; Important: record request before sending it, so it's sure to be
@@ -328,9 +324,12 @@
                  (async/go (async/>! output-ch req)
                            (p/resolve! p :done))
                  (p/then p (fn [_] pending-request))))))
-  (send-notification [this method body]
-    (let [now (protocols/instant clock)
-          notif (vary-meta (lsp.requests/notification method body) *send-advice*)]
+  (send-request [this method body]
+    (let [id (protocols/gen-id request-id*)
+          req (lsp.requests/request id method body)]
+      (protocols/send-request this req)))
+  (send-notification [this notif]
+    (let [now (protocols/instant clock)]
       (trace this trace/sending-notification notif now)
       ;; respect back pressure from clients that are slow to read; (go (>!)) will not suffice
       #?(:clj (do (async/>!! output-ch notif)
@@ -339,6 +338,9 @@
                  (async/go (async/>! output-ch notif)
                            (p/resolve! p nil))
                  p))))
+  (send-notification [this method body]
+    (let [notif (lsp.requests/notification method body)]
+      (protocols/send-notification this notif)))
   (receive-response [this {:keys [id error result] :as resp}]
     (try
       (let [now (protocols/instant clock)]
