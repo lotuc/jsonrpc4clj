@@ -234,13 +234,12 @@
                        on-close
                        request-id*
                        join
-                       on-cancel-request
+                       on-cancel-sent
                        handle-request
                        handle-notification
                        input-buffer-size
+                       pending-request-store]
 
-                       pending-received-requests*
-                       pending-sent-requests*]
   protocols/IEndpoint
   (start [this context]
     ;; Start receiving messages.
@@ -260,7 +259,7 @@
 
           reject-pending-sent-requests!
           (fn [_server exception]
-            (doseq [pending-request (protocols/-seq-sent pending-sent-requests*)]
+            (doseq [pending-request (protocols/seq-pending pending-request-store :sent)]
               (p/reject! (:p pending-request) exception)))
 
           pipeline
@@ -311,11 +310,11 @@
     (async/put! log-ch [level arg1 arg2]))
   (send-request [this req]
     (let [now (protocols/instant clock)
-          pending-request (pending-request req now #(on-cancel-request this req))]
+          pending-request (pending-request req now #(on-cancel-sent this req))]
       (trace this trace/sending-request req now)
       ;; Important: record request before sending it, so it's sure to be
       ;; available during receive-response.
-      (protocols/-save-sent! pending-sent-requests* pending-request)
+      (protocols/save-pending pending-request-store :sent req pending-request)
       ;; respect back pressure from clients that are slow to read; (go (>!)) will not suffice
       #?(:clj (do
                 (async/>!! output-ch req)
@@ -345,7 +344,7 @@
     (try
       (let [now (protocols/instant clock)]
         (if-let [{:keys [p request response started] :as req}
-                 (protocols/-remove-sent-by-resp! pending-sent-requests* resp)]
+                 (protocols/remove-pending pending-request-store :sent resp)]
           (do
             (trace this trace/received-response request resp started now)
             ;; Note that we are called from the server's pipeline, a core.async
@@ -373,7 +372,7 @@
       (try
         (trace this trace/received-request req started)
         (let [pending-req (pending-received-request this context req started)]
-          (protocols/-save-received! pending-received-requests* pending-req)
+          (protocols/save-pending pending-request-store :received req pending-req)
           (-> pending-req
               :result-promise
               ;; convert result/error to response
@@ -396,7 +395,7 @@
                      (internal-error-response resp req)))))
               (p/finally
                 (fn [resp _error]
-                  (protocols/-remove-received! pending-received-requests* req)
+                  (protocols/remove-pending pending-request-store :received req)
                   (trace this trace/sending-response req resp started (protocols/instant clock))
                   (let [resp (vary-meta resp assoc :request req)]
                     #?(:clj (async/>!! output-ch resp)
@@ -432,85 +431,67 @@
 (defmethod receive-request :default [_method _context _params] ::method-not-found)
 (defmethod receive-notification :default [_method _context _params] ::method-not-found)
 
-(defn on-cancel-send-cancelRequest
-  "https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#cancelRequest"
+(defrecord PendingRequestStore [store]
+  protocols/IPendingRequestStore
+  (save-pending [_ typ k pending-req]
+    (swap! store assoc-in [typ (:id k)] pending-req))
+  (remove-pending [_ typ k]
+    (let [id (:id k)
+          [old _] (swap-vals! store update typ dissoc id)]
+      (get-in old [typ id])))
+  (get-pending [_ typ k]
+    (get-in @store [typ (:id k)]))
+  (seq-pending [_ typ]
+    (vals (get @store typ))))
+
+(defn default-on-cancel-sent
   [server {:keys [id]}]
   (protocols/send-notification server "$/cancelRequest" {:id id}))
 
-(defn handle-notification-cancelRequest
-  "https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#cancelRequest"
-  [server _context notif]
-  (if-let [pending-req (protocols/-get-by-jsonrpc-request-or-notification
-                         (:pending-received-requests* server) notif)]
-    (p/cancel! pending-req)
-    (let [now (protocols/instant (:clock server))]
-      (trace server trace/received-unmatched-cancellation-notification notif now))))
+(defn default-handle-request [_server context {:keys [method params]}]
+  (receive-request method context params))
 
-(defrecord PendingReceivedRequestStore [m]
-  protocols/IPendingReceivedRequestStore
-  (-save-received! [_ pending-req]
-    (swap! m assoc (get-in pending-req [:request :id]) pending-req))
-  (-remove-received! [_ jsonrpc-req]
-    (swap! m dissoc (:id jsonrpc-req)))
-  (-get-by-jsonrpc-request-or-notification [_ {:keys [id method params]}]
-    (if (= method "$/cancelRequest")
-      (get @m (:id params))
-      (get @m id)))
-  (-seq-received [_] (vals @m)))
+(defn with-cancelRequest-support [handle-notification]
+  (fn [server context {:keys [method] :as notif}]
+    (case method
+      "$/cancelRequest"
+      (if-let [pending-req (protocols/get-pending
+                             (:pending-request-store server) :received (:params notif))]
+        (p/cancel! pending-req)
+        (let [now (protocols/instant (:clock server))]
+          (trace server trace/received-unmatched-cancellation-notification notif now)))
+      (handle-notification server context notif))))
 
-(defrecord PendingSentRequestStore [m]
-  protocols/IPendingSentRequestStore
-  (-save-sent! [_ pending-req]
-    (swap! m assoc (get-in pending-req [:request :id]) pending-req))
-  (-remove-sent-by-resp! [_ jsonrpc-resp]
-    (let [id (:id jsonrpc-resp)
-          [pending-requests _] (swap-vals! m dissoc id)]
-      (get pending-requests id)))
-  (-seq-sent [_] (vals @m)))
+(def default-handle-notification
+  (with-cancelRequest-support
+    (fn [_server context {:keys [method params] :as notif}]
+      (receive-notification method context params))))
 
 (defn chan-server
-  [{:keys [output-ch input-ch log-ch trace? trace-level trace-ch clock on-close
-           response-executor on-cancel-request handle-request handle-notification
-           input-buffer-size
-           pending-received-requests
-           pending-sent-requests]
+  [{:keys [output-ch input-ch clock on-close input-buffer-size
+           tracer log-ch trace? trace-level trace-ch
+           response-executor
+           on-cancel-sent handle-request handle-notification
+           pending-request-store]
     :or {clock (build-default-clock)
          on-close (constantly nil)
          response-executor :default}}]
-  (let [;; before defaulting trace-ch, so that default is "off"
-        tracer (trace/tracer-for-level (or trace-level
-                                           (when (or trace? trace-ch) "verbose")
-                                           "off"))
+  (let [tracer (or tracer
+                   ;; before defaulting trace-ch, so that default is "off"
+                   (trace/tracer-for-level
+                     (or trace-level
+                         (when (or trace? trace-ch) "verbose")
+                         "off")))
         log-ch (or log-ch (async/chan (async/sliding-buffer 20)))
         trace-ch (or trace-ch (async/chan (async/sliding-buffer 20)))
-        on-cancel-request
-        (or on-cancel-request
-            on-cancel-send-cancelRequest)
+        on-cancel-sent
+        (or on-cancel-sent default-on-cancel-sent)
         handle-request
-        (or handle-request
-            (fn [_server context {:keys [method params]}]
-              (receive-request method context params)))
+        (or handle-request default-handle-request)
         handle-notification
-        (or handle-notification
-            (fn [server context {:keys [method params] :as notif}]
-              (case method
-                "$/cancelRequest"
-                (handle-notification-cancelRequest server context notif)
-                (receive-notification method context params))))
-
-        ;; Here we can utilize the attached metadata (user attached metadata on
-        ;; request, or transport implemenetation attached metadata on response).
-
-        ;; Save request before sending
-        ;; Get saved request base on received response. SHOULD clear the saved
-        ;; request to avoid handling multiple response for same request.
-
-        pending-received-requests
-        (or pending-received-requests
-            (map->PendingReceivedRequestStore {:m (atom {})}))
-        pending-sent-requests
-        (or pending-sent-requests
-            (map->PendingSentRequestStore {:m (atom {})}))]
+        (or handle-notification default-handle-notification)
+        pending-request-store
+        (or pending-request-store (map->PendingRequestStore {:store (atom {})}))]
     (map->ChanServer
       {:output-ch output-ch
        :input-ch input-ch
@@ -524,8 +505,6 @@
        :join #?(:clj (promise) :cljs (p/deferred))
        :handle-request handle-request
        :handle-notification handle-notification
-       :on-cancel-request on-cancel-request
+       :on-cancel-sent on-cancel-sent
        :input-buffer-size (or input-buffer-size +input-buffer-size+)
-
-       :pending-received-requests* pending-received-requests
-       :pending-sent-requests* pending-sent-requests})))
+       :pending-request-store pending-request-store})))

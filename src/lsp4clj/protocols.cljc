@@ -20,13 +20,23 @@
 (defprotocol IGenId
   (gen-id [_]))
 
-(defprotocol IPendingReceivedRequestStore
-  (-save-received! [_ pending-req])
-  (-remove-received! [_ jsonrpc-req])
-  (-get-by-jsonrpc-request-or-notification [_ jsonrpc-req])
-  (-seq-received [_]))
+(defprotocol ^{:doc "
 
-(defprotocol IPendingSentRequestStore
-  (-save-sent! [_ pending-req])
-  (-remove-sent-by-resp! [_ jsonrpc-resp])
-  (-seq-sent [_]))
+`typ`: `:sent` | `:received`
+
+`remove-pending` removes given request from store & returns it.
+
+How `ChanServer` uses the store:
+- Before sending request to `output-ch`, saves it with jsonrpc request map as `k`
+- On receiving request's response from `input-ch`, removes & gets the saved
+  request with the jsonrpc response as `k`
+- On receiving request from `input-ch`, saves it with jsonrpc request map as `k`
+  before handling
+- Done handling the receivied request, removes with jsonrpc request map as `k`
+
+ "}
+ IPendingRequestStore
+  (save-pending [this typ k pending-req])
+  (get-pending [this typ k])
+  (remove-pending [this typ k])
+  (seq-pending [this typ]))
