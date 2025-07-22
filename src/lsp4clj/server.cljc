@@ -188,8 +188,9 @@
 (def send-request protocols/send-request)
 (def send-notification protocols/send-notification)
 
-(defn ^:private internal-error-response [resp req]
-  (let [error-body (lsp.errors/internal-error (select-keys req [:id :method]))]
+(defn ^:private internal-error-response [resp req data-enhancer ex]
+  (let [error-body (cond-> (lsp.errors/internal-error (select-keys req [:id :method]))
+                     data-enhancer (update :data data-enhancer ex))]
     (lsp.responses/error resp error-body)))
 
 (defn ^:private cancellation-response [resp req]
@@ -238,7 +239,8 @@
                        handle-request
                        handle-notification
                        input-buffer-size
-                       pending-request-store]
+                       pending-request-store
+                       enhance-internal-error-data]
 
   protocols/IEndpoint
   (start [this context]
@@ -275,7 +277,8 @@
                   (when-not (async/offer! client-initiated-in-ch [message-type message])
                     ;; Buffers full. Fail any waiting pending requests and...
                     (reject-pending-sent-requests!
-                      this (ex-info "Buffer of client messages exhausted." {}))
+                      this (ex-info "Buffer of client messages exhausted."
+                                    {:reason :client-messages-buffer-exhausted}))
                     ;; ... try again, but park this time.
                     (async/>! client-initiated-in-ch [message-type message])))
                 (recur))
@@ -287,7 +290,8 @@
         ;; receiving. Do cleanup.
 
         (reject-pending-sent-requests!
-          this (ex-info "Server shutting down. Input is closed so no response is possible." {}))
+          this (ex-info "Server shutting down. Input is closed so no response is possible."
+                        {:reason :server-shutting-down}))
 
         (async/close! output-ch)
         (async/close! log-ch)
@@ -392,7 +396,7 @@
                    (cancellation-response resp req)
                    (do
                      (log-error-receiving this e req)
-                     (internal-error-response resp req)))))
+                     (internal-error-response resp req enhance-internal-error-data e)))))
               (p/finally
                 (fn [resp _error]
                   (protocols/remove-pending pending-request-store :received req)
@@ -402,7 +406,8 @@
                        :cljs (async/go (async/>! output-ch resp))))))))
         (catch #?(:clj Throwable :cljs :default) e ;; exceptions thrown by receive-request
           (log-error-receiving this e req)
-          (let [resp (vary-meta (internal-error-response resp req) assoc :request req)]
+          (let [resp (vary-meta (internal-error-response resp req enhance-internal-error-data e)
+                                assoc :request req)]
             #?(:clj (async/>!! output-ch resp)
                :cljs (let [p (p/deferred)]
                        (async/go
@@ -472,7 +477,8 @@
            tracer log-ch trace? trace-level trace-ch
            response-executor
            on-cancel-sent handle-request handle-notification
-           pending-request-store]
+           pending-request-store
+           enhance-internal-error-data]
     :or {clock (build-default-clock)
          on-close (constantly nil)
          response-executor :default}}]
@@ -507,4 +513,5 @@
        :handle-notification handle-notification
        :on-cancel-sent on-cancel-sent
        :input-buffer-size (or input-buffer-size +input-buffer-size+)
-       :pending-request-store pending-request-store})))
+       :pending-request-store pending-request-store
+       :enhance-internal-error-data enhance-internal-error-data})))
